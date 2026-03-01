@@ -148,7 +148,7 @@ const TIER_OFFSET = { S: +2, A: +1, B: 0, C: -1, D: -2 };
 
 function voteWeight(tierKey) {
   const off = Math.abs(TIER_OFFSET[tierKey]);
-  return off === 2 ? 2 : 1;
+  return off === 2 ? 3 : 1;
 }
 
 // prior: one virtual B vote
