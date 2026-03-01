@@ -1,0 +1,82 @@
+[
+  {
+    "id": "honored_one",
+    "name": "Honored One",
+    "enabled": true
+  },
+  {
+    "id": "vessel",
+    "name": "Vessel",
+    "enabled": true
+  },
+  {
+    "id": "restless_gambler",
+    "name": "Restless Gambler",
+    "enabled": true
+  },
+  {
+    "id": "ten_shadows",
+    "name": "Ten Shadows",
+    "enabled": true
+  },
+  {
+    "id": "perfection",
+    "name": "Perfection",
+    "enabled": true
+  },
+  {
+    "id": "blood_manipulator",
+    "name": "Blood Manipulator",
+    "enabled": true
+  },
+  {
+    "id": "switcher",
+    "name": "Switcher",
+    "enabled": true
+  },
+  {
+    "id": "defense_attorney",
+    "name": "Defense Attorney",
+    "enabled": true
+  },
+  {
+    "id": "cursed_partners",
+    "name": "Cursed Partners",
+    "enabled": true
+  },
+  {
+    "id": "head_of_the_hei",
+    "name": "Head of the Hei",
+    "enabled": true
+  },
+  {
+    "id": "puppet_master",
+    "name": "Puppet Master",
+    "enabled": true
+  },
+  {
+    "id": "salaryman",
+    "name": "Salaryman",
+    "enabled": true
+  },
+  {
+    "id": "locust_guy",
+    "name": "Locust Guy",
+    "enabled": true
+  },
+  {
+    "id": "star_rage",
+    "name": "Star Rage",
+    "enabled": true
+  },
+  {
+    "id": "aspiring_mangaka",
+    "name": "Aspiring Mangaka",
+    "enabled": true
+  },
+  {
+    "id": "lucky_coward",
+    "name": "Lucky Coward",
+    "enabled": true
+  }
+]
