@@ -191,14 +191,63 @@ function computeGlobalBuckets() {
     const avg = computeCharacterAvgOffset(c.id);
     const tier = avgToTier(avg);
     buckets[tier].push(c.id);
-    meta[c.id] = { avg, votes: votesCount };
+    meta[c.id] = { avg, votes: votesCount, name: (charById.get(c.id)?.name || c.id) };
   }
 
+  // Sort inside tiers: avg desc, votes desc, name asc (stable feeling)
   for (const k of Object.keys(buckets)) {
-    buckets[k].sort((a, b) => meta[b].avg - meta[a].avg);
+    buckets[k].sort((a, b) => {
+      const A = meta[a];
+      const B = meta[b];
+      if (B.avg !== A.avg) return B.avg - A.avg;
+      if (B.votes !== A.votes) return B.votes - A.votes;
+      return String(A.name).localeCompare(String(B.name), "ru");
+    });
   }
 
   return { buckets, votersCount: voters.size };
+}
+
+
+// -------------------- USER BUCKETS (for panel view + my_status) --------------------
+function normalizeTierKey(t) {
+  return TIER_OFFSET.hasOwnProperty(t) ? t : "B";
+}
+
+function buildBucketsFromVoteMap(voteMap) {
+  const buckets = { S: [], A: [], B: [], C: [], D: [] };
+  for (const c of characters) {
+    const t = normalizeTierKey(voteMap?.[c.id]);
+    buckets[t].push(c.id);
+  }
+  // Sort like global feel: by global avg desc, then name asc
+  for (const k of Object.keys(buckets)) {
+    buckets[k].sort((a, b) => {
+      const av = computeCharacterAvgOffset(a);
+      const bv = computeCharacterAvgOffset(b);
+      if (bv !== av) return bv - av;
+      const an = charById.get(a)?.name || a;
+      const bn = charById.get(b)?.name || b;
+      return String(an).localeCompare(String(bn), "ru");
+    });
+  }
+  return buckets;
+}
+
+async function renderUserFinalTierlistPng(targetUserId, titleSuffix) {
+  const votes = state.finalVotes?.[targetUserId] || {};
+  const tu = state.users?.[targetUserId] || {};
+  const mainId = tu.mainId || null;
+
+  const buckets = buildBucketsFromVoteMap(votes);
+  const updated = new Date().toLocaleString("ru-RU");
+
+  return renderTierlistFromBuckets({
+    title: `${DASHBOARD_TITLE}${titleSuffix ? " " + titleSuffix : ""}`,
+    footerText: `user: ${targetUserId}. updated: ${updated}`,
+    buckets,
+    lockedId: mainId
+  });
 }
 
 // -------------------- IMAGE CONFIG --------------------
@@ -482,8 +531,16 @@ function formatTime(ts) {
 }
 
 function getUser(userId) {
-  state.users[userId] ||= { mainId: null, lockUntil: 0, wizQueue: null, wizIndex: 0, panelTierKey: "S" };
-  return state.users[userId];
+  state.users[userId] ||= { mainId: null, lockUntil: 0, lastSubmitAt: 0, wizQueue: null, wizIndex: 0, panelTierKey: "S", panelTab: "config", panelParticipantsPage: 0, panelParticipantId: null, panelDeleteTargetId: null, panelDeleteMode: null };
+
+  const u = state.users[userId];
+  if (u.lastSubmitAt == null) u.lastSubmitAt = 0;
+  if (!u.panelTierKey) u.panelTierKey = "S";
+  if (!u.panelTab) u.panelTab = "config";
+  if (u.panelParticipantsPage == null) u.panelParticipantsPage = 0;
+  if (u.panelParticipantId == null) u.panelParticipantId = null;
+
+  return u;
 }
 function getDraft(userId) {
   state.draftVotes[userId] ||= {};
@@ -801,7 +858,7 @@ function buildPanelTierSelect(userId) {
   return new ActionRowBuilder().addComponents(menu);
 }
 
-function buildPanelPayload(userId) {
+function buildPanelConfigPayload(userId) {
   const cfg = getImageConfig();
   const tierKey = (getUser(userId).panelTierKey || "S");
   const tierName = state.tiers?.[tierKey]?.name || tierKey;
@@ -840,6 +897,229 @@ function buildPanelPayload(userId) {
 
   return { embeds: [e], components: [row1, row2, buildPanelTierSelect(userId), row3] };
 }
+
+
+// -------------------- PANEL TABS + PARTICIPANTS (1-4) --------------------
+function buildPanelTabsRow(userId) {
+  const u = getUser(userId);
+  const tab = u.panelTab || "config";
+
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("panel_tab_config")
+      .setLabel("Настройки")
+      .setStyle(tab === "config" ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("panel_tab_participants")
+      .setLabel("Участники")
+      .setStyle(tab === "participants" ? ButtonStyle.Primary : ButtonStyle.Secondary)
+  );
+}
+
+function getParticipantsList() {
+  const out = [];
+  for (const [uid, votes] of Object.entries(state.finalVotes || {})) {
+    if (!votes || Object.keys(votes).length === 0) continue;
+
+    const u = state.users?.[uid] || {};
+    const inferredSubmit = (u.lockUntil && Number.isFinite(u.lockUntil)) ? (u.lockUntil - COOLDOWN_MS) : 0;
+    const lastSubmitAt = Number(u.lastSubmitAt) || inferredSubmit || 0;
+
+    out.push({
+      userId: uid,
+      mainId: u.mainId || null,
+      lastSubmitAt
+    });
+  }
+
+  out.sort((a, b) => {
+    if (b.lastSubmitAt !== a.lastSubmitAt) return b.lastSubmitAt - a.lastSubmitAt;
+    return String(a.userId).localeCompare(String(b.userId));
+  });
+  return out;
+}
+
+function buildParticipantsSelectRow(userId, participants) {
+  const u = getUser(userId);
+  const pageSize = 25;
+  const maxPage = Math.max(0, Math.ceil(participants.length / pageSize) - 1);
+  const page = Math.min(maxPage, Math.max(0, Number(u.panelParticipantsPage) || 0));
+  const start = page * pageSize;
+  const slice = participants.slice(start, start + pageSize);
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("panel_part_select_user")
+    .setPlaceholder(slice.length ? "Выбери участника" : "Нет участников")
+    .setMinValues(1)
+    .setMaxValues(1)
+    .setDisabled(slice.length === 0);
+
+  for (const p of slice) {
+    const mainName = p.mainId ? (charById.get(p.mainId)?.name || p.mainId) : "—";
+    menu.addOptions({
+      label: String(p.userId).slice(0, 100),
+      value: p.userId,
+      description: `main: ${mainName}`.slice(0, 100),
+      default: u.panelParticipantId === p.userId
+    });
+  }
+
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+function buildParticipantsNavRow(userId, participants) {
+  const u = getUser(userId);
+  const pageSize = 25;
+  const maxPage = Math.max(0, Math.ceil(participants.length / pageSize) - 1);
+  const page = Math.min(maxPage, Math.max(0, Number(u.panelParticipantsPage) || 0));
+
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("panel_part_prev").setLabel("⟵").setStyle(ButtonStyle.Secondary).setDisabled(page <= 0),
+    new ButtonBuilder().setCustomId("panel_part_next").setLabel("⟶").setStyle(ButtonStyle.Secondary).setDisabled(page >= maxPage),
+    new ButtonBuilder().setCustomId("panel_part_refresh").setLabel("Обновить").setStyle(ButtonStyle.Secondary)
+  );
+}
+
+function buildParticipantsListPayload(userId) {
+  const u = getUser(userId);
+  const participants = getParticipantsList();
+
+  const pageSize = 25;
+  const maxPage = Math.max(0, Math.ceil(participants.length / pageSize) - 1);
+  const page = Math.min(maxPage, Math.max(0, Number(u.panelParticipantsPage) || 0));
+
+  const start = page * pageSize;
+  const slice = participants.slice(start, start + pageSize);
+  const preview = slice.slice(0, 12).map((p, i) => {
+    const mainName = p.mainId ? (charById.get(p.mainId)?.name || p.mainId) : "—";
+    const when = p.lastSubmitAt ? formatTime(p.lastSubmitAt) : "—";
+    return `${start + i + 1}) <@${p.userId}>  main: **${mainName}**  submit: ${when}`;
+  });
+
+  const e = new EmbedBuilder()
+    .setTitle("Участники тир-листа")
+    .setDescription(
+      [
+        `Всего: **${participants.length}**`,
+        `Страница: **${page + 1}/${maxPage + 1}**`,
+        "",
+        preview.length ? preview.join("\n") : "Пока никто не отправлял тир-лист."
+      ].join("\n")
+    );
+
+  const actions = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("panel_close").setLabel("Закрыть").setStyle(ButtonStyle.Danger)
+  );
+
+  return {
+    embeds: [e],
+    components: [
+      buildPanelTabsRow(userId),
+      buildParticipantsSelectRow(userId, participants),
+      buildParticipantsNavRow(userId, participants),
+      actions
+    ]
+  };
+}
+
+function getUserTierCounts(votesObj) {
+  const counts = { S: 0, A: 0, B: 0, C: 0, D: 0 };
+  if (!votesObj) return counts;
+  for (const t of Object.values(votesObj)) {
+    if (counts[t] != null) counts[t]++;
+  }
+  return counts;
+}
+
+function buildParticipantsDetailPayload(userId) {
+  const u = getUser(userId);
+  const targetId = u.panelParticipantId;
+  const votes = targetId ? (state.finalVotes?.[targetId] || null) : null;
+
+  if (!targetId || !votes || Object.keys(votes).length === 0) {
+    u.panelParticipantId = null;
+    u.panelDeleteTargetId = null;
+    u.panelDeleteMode = null;
+    saveState(state);
+    return buildParticipantsListPayload(userId);
+  }
+
+  const tu = state.users?.[targetId] || {};
+  const mainName = tu.mainId ? (charById.get(tu.mainId)?.name || tu.mainId) : "—";
+  const inferredSubmit = (tu.lockUntil && Number.isFinite(tu.lockUntil)) ? (tu.lockUntil - COOLDOWN_MS) : 0;
+  const lastSubmitAt = Number(tu.lastSubmitAt) || inferredSubmit || 0;
+  const when = lastSubmitAt ? formatTime(lastSubmitAt) : "—";
+  const counts = getUserTierCounts(votes);
+
+  const e = new EmbedBuilder()
+    .setTitle("Участник")
+    .setDescription(`<@${targetId}>`)
+    .addFields(
+      { name: "Main", value: `**${mainName}**`, inline: true },
+      { name: "Submit", value: `${when}`, inline: true },
+      { name: "S/A/B/C/D", value: `${counts.S}/${counts.A}/${counts.B}/${counts.C}/${counts.D}`, inline: false }
+    );
+
+  const pending = (u.panelDeleteTargetId === targetId) ? u.panelDeleteMode : null;
+  if (pending) {
+    e.addFields({
+      name: "Подтверждение удаления",
+      value: pending === "full"
+        ? "⚠️ **Полный сброс пользователя** (удалит голос + user record + черновики). Нажми **Подтвердить** или **Отмена**."
+        : "⚠️ **Удаление голоса** (уберёт вклад в общий тир-лист). Нажми **Подтвердить** или **Отмена**.",
+      inline: false
+    });
+  }
+
+  const components = [buildPanelTabsRow(userId)];
+
+  if (!pending) {
+    const row1 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("panel_part_view_png").setLabel("Показать PNG").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("panel_part_delete_votes").setLabel("Удалить голос").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("panel_part_delete_full").setLabel("Полный сброс").setStyle(ButtonStyle.Danger)
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("panel_part_back").setLabel("Назад").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("panel_close").setLabel("Закрыть").setStyle(ButtonStyle.Secondary)
+    );
+    components.push(row1, row2);
+  } else {
+    const row1 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("panel_part_confirm_delete").setLabel("Подтвердить").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("panel_part_cancel_delete").setLabel("Отмена").setStyle(ButtonStyle.Secondary)
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("panel_part_back").setLabel("Назад").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("panel_close").setLabel("Закрыть").setStyle(ButtonStyle.Secondary)
+    );
+    components.push(row1, row2);
+  }
+
+  return { embeds: [e], components };
+}
+
+function buildParticipantsPayload(userId) {
+  const u = getUser(userId);
+  if (u.panelParticipantId) return buildParticipantsDetailPayload(userId);
+  return buildParticipantsListPayload(userId);
+}
+
+function buildPanelPayload(userId) {
+  const u = getUser(userId);
+  const tab = u.panelTab || "config";
+
+  if (tab === "participants") {
+    return buildParticipantsPayload(userId);
+  }
+
+  const base = buildPanelConfigPayload(userId);
+  base.components = [buildPanelTabsRow(userId), ...(base.components || [])];
+  return base;
+}
+
+
+
 
 function applyImageDelta(kind, delta) {
   state.settings.image ||= { width: null, height: null, icon: null };
@@ -1046,8 +1326,36 @@ if (interaction.customId === "refresh_tierlist") {
       if (interaction.customId === "my_status") {
         const main = u.mainId ? (charById.get(u.mainId)?.name || u.mainId) : "не выбран";
         const locked = isLocked(userId);
+        const votes = state.finalVotes?.[userId] || null;
+
+        // If user has submitted, show their submitted tierlist PNG (same settings as main)
+        if (votes && Object.keys(votes).length > 0) {
+          await interaction.deferReply({ ephemeral: true });
+
+          const png = await renderUserFinalTierlistPng(userId, "(твой тир-лист)");
+          const attachment = new AttachmentBuilder(png, { name: "my-tierlist.png" });
+
+          const lastSubmitAt = u.lastSubmitAt ? formatTime(u.lastSubmitAt) : "—";
+          const counts = getUserTierCounts(votes);
+
+          const emb = new EmbedBuilder()
+            .setTitle("Твой статус")
+            .setDescription(
+              [
+                `Main: **${main}**`,
+                `Submit: ${lastSubmitAt}`,
+                `S/A/B/C/D: ${counts.S}/${counts.A}/${counts.B}/${counts.C}/${counts.D}`,
+                locked ? `Кулдаун до: **${formatTime(u.lockUntil)}**` : "Можно отправлять оценку: **да**"
+              ].join("\n")
+            )
+            .setImage("attachment://my-tierlist.png");
+
+          return interaction.editReply({ embeds: [emb], files: [attachment] });
+        }
+
         const lines = [
           `Main: **${main}**`,
+          "Ты ещё не отправлял тир-лист.",
           locked ? `Кулдаун до: **${formatTime(u.lockUntil)}**` : "Можно отправлять оценку: **да**"
         ];
         return interaction.reply({ content: lines.join("\n"), ephemeral: true });
@@ -1058,6 +1366,129 @@ if (interaction.customId === "refresh_tierlist") {
       if (interaction.customId.startsWith("panel_")) {
         if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав.", ephemeral: true });
         const userId = interaction.user.id;
+
+        const uPanel = getUser(userId);
+
+        // Tabs
+        if (interaction.customId === "panel_tab_config") {
+          uPanel.panelTab = "config";
+          uPanel.panelParticipantId = null;
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+        if (interaction.customId === "panel_tab_participants") {
+          uPanel.panelTab = "participants";
+          uPanel.panelParticipantId = null;
+          uPanel.panelParticipantsPage = 0;
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+
+        // Participants navigation
+        if (interaction.customId === "panel_part_prev") {
+          uPanel.panelTab = "participants";
+          uPanel.panelParticipantId = null;
+          uPanel.panelParticipantsPage = Math.max(0, (Number(uPanel.panelParticipantsPage) || 0) - 1);
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+        if (interaction.customId === "panel_part_next") {
+          uPanel.panelTab = "participants";
+          uPanel.panelParticipantId = null;
+          uPanel.panelParticipantsPage = (Number(uPanel.panelParticipantsPage) || 0) + 1;
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+        if (interaction.customId === "panel_part_refresh") {
+          uPanel.panelTab = "participants";
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+        if (interaction.customId === "panel_part_back") {
+          uPanel.panelTab = "participants";
+          uPanel.panelParticipantId = null;
+          uPanel.panelDeleteTargetId = null;
+          uPanel.panelDeleteMode = null;
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+
+        // Step 5: View user's tierlist as PNG (same settings as main)
+        if (interaction.customId === "panel_part_view_png") {
+          const targetId = uPanel.panelParticipantId;
+          const votes = targetId ? state.finalVotes?.[targetId] : null;
+          if (!targetId || !votes || Object.keys(votes).length === 0) {
+            return interaction.reply({ content: "У этого пользователя нет сохранённого тир-листа.", ephemeral: true });
+          }
+
+          await interaction.deferReply({ ephemeral: true });
+          const png = await renderUserFinalTierlistPng(targetId, "(его тир-лист)");
+          const attachment = new AttachmentBuilder(png, { name: "user-tierlist.png" });
+
+          const emb = new EmbedBuilder()
+            .setTitle("Tierlist пользователя")
+            .setDescription(`<@${targetId}>`)
+            .setImage("attachment://user-tierlist.png");
+
+          return interaction.editReply({ embeds: [emb], files: [attachment] });
+        }
+
+        // Step 6: Delete actions with confirm (safe delete vs full reset)
+        if (interaction.customId === "panel_part_delete_votes") {
+          const targetId = uPanel.panelParticipantId;
+          if (!targetId) return interaction.reply({ content: "Не выбран участник.", ephemeral: true });
+
+          uPanel.panelDeleteTargetId = targetId;
+          uPanel.panelDeleteMode = "votes";
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+
+        if (interaction.customId === "panel_part_delete_full") {
+          const targetId = uPanel.panelParticipantId;
+          if (!targetId) return interaction.reply({ content: "Не выбран участник.", ephemeral: true });
+
+          uPanel.panelDeleteTargetId = targetId;
+          uPanel.panelDeleteMode = "full";
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+
+        if (interaction.customId === "panel_part_cancel_delete") {
+          uPanel.panelDeleteTargetId = null;
+          uPanel.panelDeleteMode = null;
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+
+        if (interaction.customId === "panel_part_confirm_delete") {
+          const targetId = uPanel.panelDeleteTargetId;
+          const mode = uPanel.panelDeleteMode;
+
+          if (!targetId || !mode) {
+            return interaction.reply({ content: "Нечего подтверждать.", ephemeral: true });
+          }
+
+          // perform deletion
+          if (mode === "votes") {
+            delete state.finalVotes[targetId];
+          } else if (mode === "full") {
+            delete state.finalVotes[targetId];
+            delete state.draftVotes[targetId];
+            delete state.users[targetId];
+          }
+
+          // clear pending + go back to list
+          uPanel.panelDeleteTargetId = null;
+          uPanel.panelDeleteMode = null;
+          uPanel.panelParticipantId = null;
+          saveState(state);
+
+          await interaction.deferUpdate();
+          await refreshDashboard(client);
+          return interaction.editReply(buildPanelPayload(userId));
+        }
+
 
         if (interaction.customId === "panel_close") {
           return interaction.update({ content: "Ок.", embeds: [], components: [] });
@@ -1213,6 +1644,7 @@ if (interaction.customId === "refresh_tierlist") {
         await interaction.deferUpdate();
 
         submitWizardVotes(userId);
+        u.lastSubmitAt = Date.now();
         lockUser(userId);
         u.wizQueue = null;
         u.wizIndex = 0;
@@ -1240,7 +1672,18 @@ if (interaction.customId === "panel_select_tier") {
         return interaction.update(buildPanelPayload(userId));
       }
 
-      
+
+      if (interaction.customId === "panel_part_select_user") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав.", ephemeral: true });
+        const targetId = interaction.values[0];
+        u.panelTab = "participants";
+        u.panelParticipantId = targetId;
+        u.panelDeleteTargetId = null;
+        u.panelDeleteMode = null;
+        saveState(state);
+        return interaction.update(buildPanelPayload(userId));
+      }
+
       if (interaction.customId === "select_main") {
         if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
 
