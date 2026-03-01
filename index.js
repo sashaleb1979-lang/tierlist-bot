@@ -708,10 +708,10 @@ async function buildWizardPayload(userId) {
 
 // -------------------- DASHBOARD --------------------
 function dashboardComponents() {
-  // никаких лишних кнопок в закрепе: только старт и статус
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("start_rating").setLabel("Начать оценку").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("my_status").setLabel("Мой статус").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId("my_status").setLabel("Мой статус").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("refresh_tierlist").setLabel("Обновить тир-лист").setStyle(ButtonStyle.Secondary)
   );
   return [row];
 }
@@ -868,6 +868,21 @@ function resetImageOverrides() {
   state.settings.image.icon = null;
 }
 
+
+// -------------------- SAFE REPLY HELPERS --------------------
+async function safeRespond(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply(payload);
+    }
+    return await interaction.reply(payload);
+  } catch (e) {
+    try {
+      return await interaction.followUp({ ...payload, ephemeral: true });
+    } catch {}
+  }
+}
+
 // -------------------- CLIENT --------------------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -914,12 +929,17 @@ client.on("interactionCreate", async (interaction) => {
     // ---------------- SLASH COMMANDS ----------------
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "setup") {
-        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
-        const ch = interaction.options.getChannel("channel", true);
-        await interaction.deferReply({ ephemeral: true });
-        await ensureDashboardMessage(client, ch.id);
-        return interaction.editReply("Готово. Dashboard создан/обновлён (и закреплён, если бот смог).");
-      }
+  if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
+  const ch = interaction.options.getChannel("channel", true);
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    await ensureDashboardMessage(client, ch.id);
+    return interaction.editReply("Готово. Dashboard создан/обновлён (и закреплён, если бот смог).");
+  } catch (e) {
+    console.error("setup failed:", e);
+    return interaction.editReply(`Setup failed: ${e?.message || "unknown"}`);
+  }
+}
 
       if (interaction.commandName === "tiers") {
         if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
@@ -1013,6 +1033,15 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton()) {
       const userId = interaction.user.id;
       const u = getUser(userId);
+
+if (interaction.customId === "refresh_tierlist") {
+  if (!isModerator(interaction)) {
+    return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  const ok = await refreshDashboard(client);
+  return interaction.editReply(ok ? "Ок. Тир-лист обновлён." : "Не нашёл dashboard. Сначала /setup.");
+}
 
       if (interaction.customId === "my_status") {
         const main = u.mainId ? (charById.get(u.mainId)?.name || u.mainId) : "не выбран";
@@ -1228,9 +1257,7 @@ if (interaction.customId === "panel_select_tier") {
   } catch (e) {
     console.error(e);
     if (interaction.isRepliable()) {
-      try {
-        return interaction.reply({ content: "Ошибка. Проверь логи.", ephemeral: true });
-      } catch {}
+      return safeRespond(interaction, { content: `Ошибка: ${e?.message || "unknown"}`, ephemeral: true });
     }
   }
 });
