@@ -30,6 +30,13 @@ const {
   DATA_DIR = "./data",
   ADMIN_ROLE_IDS = "",
 
+  // Influence roles (optional)
+  TIER_ROLE_1_ID = "",
+  TIER_ROLE_2_ID = "",
+  TIER_ROLE_3_ID = "",
+  TIER_ROLE_4_ID = "",
+  TIER_ROLE_5_ID = "",
+
   // Image tuning (defaults; can be overridden by /image set)
   IMG_WIDTH = "2000",
   IMG_HEIGHT = "1200",
@@ -48,6 +55,80 @@ const ADMIN_ROLE_SET = new Set(
     .map(s => s.trim())
     .filter(Boolean)
 );
+
+// -------------------- INFLUENCE (ROLE-BASED) --------------------
+// Users can have special tier roles that increase how strongly their personal tier-list affects the global result.
+const ROLE_INFLUENCE = new Map([
+  [String(TIER_ROLE_1_ID || ""), 2.0],
+  [String(TIER_ROLE_2_ID || ""), 2.4],
+  [String(TIER_ROLE_3_ID || ""), 2.8],
+  [String(TIER_ROLE_4_ID || ""), 3.2],
+  [String(TIER_ROLE_5_ID || ""), 3.6]
+]);
+
+function resolveInfluenceFromMember(member) {
+  try {
+    const roles = member?.roles?.cache;
+    if (!roles) return { mult: 1, roleId: null };
+
+    let best = 1;
+    let bestRole = null;
+
+    for (const [rid, mult] of ROLE_INFLUENCE.entries()) {
+      if (!rid) continue;
+      if (roles.has(rid) && mult > best) {
+        best = mult;
+        bestRole = rid;
+      }
+    }
+    return { mult: best, roleId: bestRole };
+  } catch {
+    return { mult: 1, roleId: null };
+  }
+}
+
+function getStoredInfluenceMultiplier(userId) {
+  const u = state.users?.[userId];
+  const mult = Number(u?.influenceMultiplier);
+  return Number.isFinite(mult) && mult > 0 ? mult : 1;
+}
+
+async function backfillInfluenceForExistingVoters(client, { refresh = true } = {}) {
+  // Updates influenceMultiplier for everyone who already has a final vote stored.
+  // This makes old (already submitted) votes start using role influence without users re-submitting.
+  const voterIds = Object.entries(state.finalVotes || {})
+    .filter(([uid, votes]) => votes && Object.keys(votes).length > 0)
+    .map(([uid]) => uid);
+
+  if (voterIds.length === 0) return { total: 0, changed: 0 };
+
+  const guild = await client.guilds.fetch(GUILD_ID);
+  let changed = 0;
+
+  for (const uid of voterIds) {
+    const member = await guild.members.fetch(uid).catch(() => null);
+    const inf = resolveInfluenceFromMember(member);
+
+    const u = getUser(uid);
+    const prev = Number(u.influenceMultiplier) || 1;
+
+    if (prev !== inf.mult || (u.influenceRoleId || null) !== (inf.roleId || null)) {
+      u.influenceMultiplier = inf.mult;
+      u.influenceRoleId = inf.roleId;
+      u.influenceUpdatedAt = Date.now();
+      changed++;
+    }
+  }
+
+  if (changed > 0) saveState(state);
+
+  const hasDashboard = Boolean(state.settings?.channelId && state.settings?.dashboardMessageId);
+  if (refresh && changed > 0 && hasDashboard) {
+    await refreshDashboard(client).catch(() => {});
+  }
+
+  return { total: voterIds.length, changed };
+}
 
 // -------------------- PATHS --------------------
 const CONFIG_DIR = path.join(__dirname, "config");
@@ -156,10 +237,13 @@ function computeCharacterAvgOffset(characterId) {
   let sum = 0;
   let wsum = 1;
 
-  for (const votes of Object.values(state.finalVotes)) {
+  for (const [uid, votes] of Object.entries(state.finalVotes)) {
     const t = votes?.[characterId];
     if (!t) continue;
-    const w = voteWeight(t);
+
+    const mult = getStoredInfluenceMultiplier(uid);
+    const w = voteWeight(t) * mult;
+
     sum += TIER_OFFSET[t] * w;
     wsum += w;
   }
@@ -531,7 +615,7 @@ function formatTime(ts) {
 }
 
 function getUser(userId) {
-  state.users[userId] ||= { mainId: null, lockUntil: 0, lastSubmitAt: 0, wizQueue: null, wizIndex: 0, panelTierKey: "S", panelTab: "config", panelParticipantsPage: 0, panelParticipantId: null, panelDeleteTargetId: null, panelDeleteMode: null };
+  state.users[userId] ||= { mainId: null, lockUntil: 0, lastSubmitAt: 0, wizQueue: null, wizIndex: 0, influenceMultiplier: 1, influenceRoleId: null, influenceUpdatedAt: 0, panelTierKey: "S", panelTab: "config", panelParticipantsPage: 0, panelParticipantId: null, panelDeleteTargetId: null, panelDeleteMode: null };
 
   const u = state.users[userId];
   if (u.lastSubmitAt == null) u.lastSubmitAt = 0;
@@ -1164,7 +1248,12 @@ async function safeRespond(interaction, payload) {
 }
 
 // -------------------- CLIENT --------------------
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers
+  ]
+});
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -1180,7 +1269,53 @@ client.once("ready", async () => {
       console.error("Auto-setup failed:", e.message);
     }
   }
+  // A) realtime influence: refresh existing voters once on startup
+  try {
+    const res = await backfillInfluenceForExistingVoters(client, { refresh: true });
+    if (res.total > 0) {
+      console.log(`[influence] startup backfill: changed ${res.changed}/${res.total}`);
+    }
+  } catch (e) {
+    console.error("[influence] startup backfill failed:", e?.message || e);
+  }
+
 });
+
+
+client.on("guildMemberUpdate", async (oldMember, newMember) => {
+  // realtime influence update when tier roles are changed
+  try {
+    const uid = newMember.id;
+
+    const hasVote = Boolean(state.finalVotes?.[uid] && Object.keys(state.finalVotes[uid] || {}).length > 0);
+    const isTracked = Boolean(state.users?.[uid]);
+
+    // Avoid tracking everyone in the server; only update if this user matters to our state.
+    if (!hasVote && !isTracked) return;
+
+    const inf = resolveInfluenceFromMember(newMember);
+    const u = getUser(uid);
+
+    const prev = Number(u.influenceMultiplier) || 1;
+    const prevRole = u.influenceRoleId || null;
+
+    if (prev === inf.mult && prevRole === (inf.roleId || null)) return;
+
+    u.influenceMultiplier = inf.mult;
+    u.influenceRoleId = inf.roleId;
+    u.influenceUpdatedAt = Date.now();
+    saveState(state);
+
+    if (hasVote) {
+      // their weight affects global tierlist -> refresh image
+      await refreshDashboard(client).catch(() => {});
+    }
+  } catch {
+    // ignore
+  }
+});
+
+
 
 client.on("interactionCreate", async (interaction) => {
   try {
@@ -1644,6 +1779,13 @@ if (interaction.customId === "refresh_tierlist") {
         await interaction.deferUpdate();
 
         submitWizardVotes(userId);
+
+        // store influence multiplier based on tier roles at submit time
+        const inf = resolveInfluenceFromMember(interaction.member);
+        u.influenceMultiplier = inf.mult;
+        u.influenceRoleId = inf.roleId;
+        u.influenceUpdatedAt = Date.now();
+
         u.lastSubmitAt = Date.now();
         lockUser(userId);
         u.wizQueue = null;
