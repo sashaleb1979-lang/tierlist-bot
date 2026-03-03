@@ -60,10 +60,10 @@ const ADMIN_ROLE_SET = new Set(
 // Users can have special tier roles that increase how strongly their personal tier-list affects the global result.
 const ROLE_INFLUENCE = new Map([
   [String(TIER_ROLE_1_ID || ""), 2.0],
-  [String(TIER_ROLE_2_ID || ""), 2.4],
-  [String(TIER_ROLE_3_ID || ""), 2.8],
-  [String(TIER_ROLE_4_ID || ""), 3.2],
-  [String(TIER_ROLE_5_ID || ""), 3.6]
+  [String(TIER_ROLE_2_ID || ""), 2.5],
+  [String(TIER_ROLE_3_ID || ""), 3.0],
+  [String(TIER_ROLE_4_ID || ""), 3.5],
+  [String(TIER_ROLE_5_ID || ""), 4.0]
 ]);
 
 function resolveInfluenceFromMember(member) {
