@@ -1,5 +1,5 @@
 require("dotenv").config();
-const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require("discord.js");
+const { REST, Routes, SlashCommandBuilder } = require("discord.js");
 
 const token = process.env.DISCORD_TOKEN;
 const clientId = process.env.CLIENT_ID;
@@ -18,8 +18,7 @@ const commands = [
       opt.setName("channel")
         .setDescription("Канал, где будет тир-лист")
         .setRequired(true)
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    ),
 
   new SlashCommandBuilder()
     .setName("tiers")
@@ -44,18 +43,15 @@ const commands = [
             .setDescription("Новое название (на картинке)")
             .setRequired(true)
         )
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    ),
 
   new SlashCommandBuilder()
     .setName("rebuild")
-    .setDescription("Пересобрать картинку тир-листа (mods)")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    .setDescription("Пересобрать картинку тир-листа (mods)"),
 
   new SlashCommandBuilder()
     .setName("stats")
-    .setDescription("Статус бота/дашборда (mods)")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    .setDescription("Статус бота/дашборда (mods)"),
 
   new SlashCommandBuilder()
     .setName("debug")
@@ -63,8 +59,7 @@ const commands = [
     .addSubcommand(sc =>
       sc.setName("fonts")
         .setDescription("Показать какие шрифты найдены/используются")
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    ),
 
   new SlashCommandBuilder()
     .setName("image")
@@ -97,13 +92,11 @@ const commands = [
             .setMinValue(64)
             .setMaxValue(256)
         )
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    ),
 
   new SlashCommandBuilder()
     .setName("panel")
     .setDescription("Открыть панель управления тир-листом (mods)")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(token);
