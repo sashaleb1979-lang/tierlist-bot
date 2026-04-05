@@ -1,6 +1,8 @@
 require("dotenv").config();
 
 const fs = require("fs");
+const http = require("http");
+const https = require("https");
 const path = require("path");
 const { PassThrough } = require("stream");
 const PImage = require("pureimage");
@@ -139,6 +141,9 @@ const TIERS_DEFAULT_PATH = path.join(CONFIG_DIR, "tiers.default.json");
 
 const STATE_DIR = path.resolve(__dirname, DATA_DIR);
 const STATE_PATH = path.join(STATE_DIR, "state.json");
+const CUSTOM_CHARACTERS_PATH = path.join(STATE_DIR, "characters.custom.json");
+const CUSTOM_CHARACTERS_DIR = path.join(STATE_DIR, "characters");
+const MAIN_SELECT_PAGE_SIZE = 25;
 
 function ensureDir(p) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
@@ -146,10 +151,61 @@ function ensureDir(p) {
 function loadJson(p) {
   return JSON.parse(fs.readFileSync(p, "utf-8"));
 }
+function loadJsonIfExists(p, fallback) {
+  try {
+    if (!fs.existsSync(p)) return fallback;
+    return JSON.parse(fs.readFileSync(p, "utf-8"));
+  } catch {
+    return fallback;
+  }
+}
+function saveJsonAtomic(p, value) {
+  ensureDir(path.dirname(p));
+  const tmp = p + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), "utf-8");
+  fs.renameSync(tmp, p);
+}
+function writeBufferAtomic(p, buffer) {
+  ensureDir(path.dirname(p));
+  const tmp = p + ".tmp";
+  fs.writeFileSync(tmp, buffer);
+  fs.renameSync(tmp, p);
+}
 
-const characters = loadJson(CHARACTERS_PATH).filter(c => c.enabled);
-const charById = new Map(characters.map(c => [c.id, c]));
+let characters = [];
+let charById = new Map();
 const tierDefaults = loadJson(TIERS_DEFAULT_PATH);
+
+function readCustomCharacters() {
+  const raw = loadJsonIfExists(CUSTOM_CHARACTERS_PATH, []);
+  return Array.isArray(raw) ? raw : [];
+}
+
+function reloadCharacterCatalog() {
+  const merged = [];
+  const seen = new Set();
+
+  for (const source of [loadJson(CHARACTERS_PATH), readCustomCharacters()]) {
+    if (!Array.isArray(source)) continue;
+    for (const item of source) {
+      const id = String(item?.id || "").trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+
+      merged.push({
+        id,
+        name: String(item?.name || id).trim() || id,
+        enabled: item?.enabled !== false
+      });
+    }
+  }
+
+  characters = merged.filter(c => c.enabled);
+  charById = new Map(characters.map(c => [c.id, c]));
+  return characters;
+}
+
+reloadCharacterCatalog();
 
 // -------------------- STATE --------------------
 function defaultState() {
@@ -210,6 +266,131 @@ function saveState(st) {
 }
 
 let state = loadState();
+
+const CYRILLIC_TO_LATIN = {
+  а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "yo", ж: "zh", з: "z",
+  и: "i", й: "y", к: "k", л: "l", м: "m", н: "n", о: "o", п: "p", р: "r",
+  с: "s", т: "t", у: "u", ф: "f", х: "h", ц: "ts", ч: "ch", ш: "sh", щ: "sch",
+  ъ: "", ы: "y", ь: "", э: "e", ю: "yu", я: "ya"
+};
+
+function transliterateToLatin(value) {
+  return String(value || "")
+    .toLowerCase()
+    .split("")
+    .map(ch => CYRILLIC_TO_LATIN[ch] ?? ch)
+    .join("");
+}
+
+function normalizeCharacterId(value) {
+  return transliterateToLatin(value)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_");
+}
+
+function getBaseCharacterImagePath(characterId) {
+  return path.join(ASSETS_DIR, "characters", `${characterId}.png`);
+}
+
+function getCustomCharacterImagePath(characterId) {
+  return path.join(CUSTOM_CHARACTERS_DIR, `${characterId}.png`);
+}
+
+function resolveCharacterImagePath(characterId) {
+  const customPath = getCustomCharacterImagePath(characterId);
+  if (fs.existsSync(customPath)) return customPath;
+
+  const basePath = getBaseCharacterImagePath(characterId);
+  if (fs.existsSync(basePath)) return basePath;
+
+  return null;
+}
+
+function encodePngToBuffer(img) {
+  const chunks = [];
+  const stream = new PassThrough();
+  stream.on("data", c => chunks.push(c));
+  return PImage.encodePNGToStream(img, stream).then(() => {
+    stream.end();
+    return Buffer.concat(chunks);
+  });
+}
+
+function bufferToStream(buffer) {
+  const stream = new PassThrough();
+  stream.end(buffer);
+  return stream;
+}
+
+function detectAttachmentImageType(attachment) {
+  const contentType = String(attachment?.contentType || "").toLowerCase();
+  const source = `${attachment?.name || ""} ${attachment?.url || ""}`.toLowerCase();
+
+  if (contentType.includes("png") || /\.png(?:$|[?\s])/.test(source)) return "png";
+  if (contentType.includes("jpeg") || contentType.includes("jpg") || /\.jpe?g(?:$|[?\s])/.test(source)) return "jpeg";
+  return null;
+}
+
+function downloadBuffer(url, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 5) return reject(new Error("Слишком много редиректов при скачивании картинки."));
+
+    const transport = String(url).startsWith("https:") ? https : http;
+    const req = transport.get(url, (res) => {
+      if (res.statusCode && [301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        const nextUrl = new URL(res.headers.location, url).toString();
+        res.resume();
+        return resolve(downloadBuffer(nextUrl, redirects + 1));
+      }
+
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`Не удалось скачать картинку (${res.statusCode || "unknown"}).`));
+      }
+
+      const chunks = [];
+      res.on("data", chunk => chunks.push(chunk));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", reject);
+    });
+
+    req.on("error", reject);
+  });
+}
+
+async function normalizeCharacterImageBuffer(buffer, imageType, size = 512) {
+  const input = imageType === "png"
+    ? await PImage.decodePNGFromStream(bufferToStream(buffer))
+    : await PImage.decodeJPEGFromStream(bufferToStream(buffer));
+
+  if (!input?.width || !input?.height) {
+    throw new Error("Не удалось прочитать размеры картинки.");
+  }
+
+  const canvas = PImage.make(size, size);
+  const ctx = canvas.getContext("2d");
+  const scale = Math.min(size / input.width, size / input.height);
+  const drawW = Math.max(1, Math.round(input.width * scale));
+  const drawH = Math.max(1, Math.round(input.height * scale));
+  const x = Math.floor((size - drawW) / 2);
+  const y = Math.floor((size - drawH) / 2);
+
+  ctx.drawImage(input, x, y, drawW, drawH);
+  return encodePngToBuffer(canvas);
+}
+
+function appendCharacterToActiveWizards(characterId) {
+  for (const userId of Object.keys(state.users || {})) {
+    const u = getUser(userId);
+    if (!u.mainId || !Array.isArray(u.wizQueue) || wizardDone(userId)) continue;
+    if (u.mainId === characterId) continue;
+    if (u.wizQueue.includes(characterId)) continue;
+    u.wizQueue.push(characterId);
+  }
+}
 
 // -------------------- MOD CHECK --------------------
 function isModerator(interaction) {
@@ -412,8 +593,8 @@ const iconCache = new Map();
 async function loadIcon(characterId) {
   if (iconCache.has(characterId)) return iconCache.get(characterId);
 
-  const p = path.join(ASSETS_DIR, "characters", `${characterId}.png`);
-  if (!fs.existsSync(p)) {
+  const p = resolveCharacterImagePath(characterId);
+  if (!p || !fs.existsSync(p)) {
     iconCache.set(characterId, null);
     return null;
   }
@@ -558,13 +739,7 @@ async function renderTierlistFromBuckets({
     }
   }
 
-// encode to buffer
-  const chunks = [];
-  const stream = new PassThrough();
-  stream.on("data", c => chunks.push(c));
-  await PImage.encodePNGToStream(img, stream);
-  stream.end();
-  return Buffer.concat(chunks);
+  return encodePngToBuffer(img);
 }
 
 async function renderGlobalTierlistPng() {
@@ -580,10 +755,13 @@ async function renderGlobalTierlistPng() {
 function computeDraftBuckets(userId) {
   const u = getUser(userId);
   const d = getDraft(userId);
+  const f = getFinal(userId);
+  const useExistingVotes = u.wizMode === "new";
 
   const buckets = { S: [], A: [], B: [], C: [], D: [] };
   for (const c of characters) {
-    const t = (d[c.id] && TIER_OFFSET[d[c.id]] !== undefined) ? d[c.id] : "B";
+    const baseTier = useExistingVotes && f[c.id] ? f[c.id] : "B";
+    const t = (d[c.id] && TIER_OFFSET[d[c.id]] !== undefined) ? d[c.id] : baseTier;
     buckets[t].push(c.id);
   }
 
@@ -615,7 +793,7 @@ function formatTime(ts) {
 }
 
 function getUser(userId) {
-  state.users[userId] ||= { mainId: null, lockUntil: 0, lastSubmitAt: 0, wizQueue: null, wizIndex: 0, influenceMultiplier: 1, influenceRoleId: null, influenceUpdatedAt: 0, panelTierKey: "S", panelTab: "config", panelParticipantsPage: 0, panelParticipantId: null, panelDeleteTargetId: null, panelDeleteMode: null };
+  state.users[userId] ||= { mainId: null, lockUntil: 0, lastSubmitAt: 0, wizQueue: null, wizIndex: 0, wizMode: null, influenceMultiplier: 1, influenceRoleId: null, influenceUpdatedAt: 0, panelTierKey: "S", panelTab: "config", panelParticipantsPage: 0, panelParticipantId: null, panelDeleteTargetId: null, panelDeleteMode: null, mainSelectPage: 0 };
 
   const u = state.users[userId];
   if (u.lastSubmitAt == null) u.lastSubmitAt = 0;
@@ -623,6 +801,8 @@ function getUser(userId) {
   if (!u.panelTab) u.panelTab = "config";
   if (u.panelParticipantsPage == null) u.panelParticipantsPage = 0;
   if (u.panelParticipantId == null) u.panelParticipantId = null;
+  if (u.mainSelectPage == null) u.mainSelectPage = 0;
+  if (u.wizMode == null) u.wizMode = null;
 
   return u;
 }
@@ -643,6 +823,7 @@ function isLocked(userId) {
 function setMain(userId, mainId) {
   const u = getUser(userId);
   u.mainId = mainId;
+  u.mainSelectPage = findCharacterMainPage(mainId);
 
   // remove main from draft/final if present
   const d = getDraft(userId);
@@ -651,10 +832,32 @@ function setMain(userId, mainId) {
   if (f[mainId]) delete f[mainId];
 }
 
-function startWizard(userId) {
+function hasSubmittedTierlist(userId) {
+  const finalVotes = state.finalVotes?.[userId] || {};
+  return Object.keys(finalVotes).length > 0;
+}
+
+function getPendingNewCharacterIds(userId) {
+  const u = getUser(userId);
+  const finalVotes = getFinal(userId);
+  return characters
+    .map(c => c.id)
+    .filter(cid => cid !== u.mainId)
+    .filter(cid => !finalVotes[cid]);
+}
+
+function canUseCurrentWizard(userId) {
+  const u = getUser(userId);
+  return !isLocked(userId) || u.wizMode === "new";
+}
+
+function startWizard(userId, mode = "full") {
   const u = getUser(userId);
   state.draftVotes[userId] = {};
-  u.wizQueue = characters.map(c => c.id).filter(cid => cid !== u.mainId);
+  u.wizMode = mode;
+  u.wizQueue = mode === "new"
+    ? getPendingNewCharacterIds(userId)
+    : characters.map(c => c.id).filter(cid => cid !== u.mainId);
   u.wizIndex = 0;
 }
 
@@ -710,23 +913,60 @@ function lockUser(userId) {
 }
 
 // -------------------- UI BUILDERS --------------------
-function buildMainSelect(userId) {
+function getMainSelectPageCount() {
+  return Math.max(1, Math.ceil(characters.length / MAIN_SELECT_PAGE_SIZE));
+}
+
+function findCharacterMainPage(characterId) {
+  const idx = characters.findIndex(c => c.id === characterId);
+  if (idx < 0) return 0;
+  return Math.floor(idx / MAIN_SELECT_PAGE_SIZE);
+}
+
+function clampMainSelectPage(page) {
+  return Math.max(0, Math.min(Number(page) || 0, getMainSelectPageCount() - 1));
+}
+
+function buildMainSelectRows(userId) {
   const u = getUser(userId);
+  const page = clampMainSelectPage(u.mainSelectPage);
+  const start = page * MAIN_SELECT_PAGE_SIZE;
+  const slice = characters.slice(start, start + MAIN_SELECT_PAGE_SIZE);
+  u.mainSelectPage = page;
 
   const menu = new StringSelectMenuBuilder()
     .setCustomId("select_main")
-    .setPlaceholder("Выбери своего main (обязательно)")
+    .setPlaceholder(`Выбери своего main (${page + 1}/${getMainSelectPageCount()})`)
     .setMinValues(1)
     .setMaxValues(1);
 
-  for (const c of characters) {
+  for (const c of slice) {
     menu.addOptions({
-      label: c.name,
+      label: c.name.slice(0, 100),
       value: c.id,
       default: u.mainId === c.id
     });
   }
-  return new ActionRowBuilder().addComponents(menu);
+
+  const rows = [new ActionRowBuilder().addComponents(menu)];
+  if (getMainSelectPageCount() > 1) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("main_page_prev")
+          .setLabel(`Персонажи ${page + 1}/${getMainSelectPageCount()} <-`)
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(page <= 0),
+        new ButtonBuilder()
+          .setCustomId("main_page_next")
+          .setLabel("->")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(page >= getMainSelectPageCount() - 1)
+      )
+    );
+  }
+
+  return rows;
 }
 
 function buildStartButtons(userId) {
@@ -777,6 +1017,7 @@ function buildStartEmbed(userId) {
   const u = getUser(userId);
   const locked = isLocked(userId);
   const main = u.mainId ? (charById.get(u.mainId)?.name || u.mainId) : "не выбран";
+  const hasFinal = hasSubmittedTierlist(userId);
 
   const e = new EmbedBuilder()
     .setTitle("Оценка персонажей")
@@ -785,7 +1026,8 @@ function buildStartEmbed(userId) {
         "1) выбери своего main.",
         "2) появится твой личный тир-лист.",
         "3) оценивай персонажей по одному кнопками S A B C D.",
-        "main будет серым и заблокированным."
+        "main будет серым и заблокированным.",
+        hasFinal ? "Для новых персонажей на дашборде есть кнопка **Оценить новых**." : "После первой отправки новые персонажи можно будет дооценивать кнопкой **Оценить новых**."
       ].join("\n")
     )
     .addFields({ name: "Main", value: `**${main}**`, inline: true });
@@ -814,8 +1056,8 @@ async function buildWizardPayload(userId) {
   // 2) Current character image (if exists)
   let hasCharImage = false;
   if (!finished && currentId) {
-    const iconPath = path.join(ASSETS_DIR, "characters", `${currentId}.png`);
-    if (fs.existsSync(iconPath)) {
+    const iconPath = resolveCharacterImagePath(currentId);
+    if (iconPath && fs.existsSync(iconPath)) {
       files.push(new AttachmentBuilder(fs.readFileSync(iconPath), { name: "character.png" }));
       hasCharImage = true;
     }
@@ -826,7 +1068,9 @@ async function buildWizardPayload(userId) {
     .setDescription(
       finished
         ? "готово. проверь свой тир-лист ниже и нажми **отправить**."
-        : "выбери тир для текущего персонажа кнопками S A B C D."
+        : (u.wizMode === "new"
+            ? "доставь оценку только для новых персонажей кнопками S A B C D."
+            : "выбери тир для текущего персонажа кнопками S A B C D.")
     )
     .addFields(
       { name: "Main", value: `⬛ **${lockedMain}** (locked)`, inline: true },
@@ -851,6 +1095,7 @@ async function buildWizardPayload(userId) {
 function dashboardComponents() {
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("start_rating").setLabel("Начать оценку").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("rate_new_characters").setLabel("Оценить новых").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("my_status").setLabel("Мой статус").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("refresh_tierlist").setLabel("Обновить тир-лист").setStyle(ButtonStyle.Secondary)
   );
@@ -874,7 +1119,7 @@ async function ensureDashboardMessage(client, channelId) {
 
   const embed = new EmbedBuilder()
     .setTitle(DASHBOARD_TITLE)
-    .setDescription("кнопка **начать оценку** откроет опрос (ephemeral). общий тир-лист обновится после **отправить**.")
+    .setDescription("кнопка **начать оценку** откроет полный опрос. **оценить новых** позволит дооценить только что добавленных персонажей без сброса твоего тир-листа.")
     .setImage("attachment://tierlist.png");
 
   if (!msg) {
@@ -910,7 +1155,7 @@ async function refreshDashboard(client) {
 
   const embed = new EmbedBuilder()
     .setTitle(DASHBOARD_TITLE)
-    .setDescription("кнопка **начать оценку** откроет опрос (ephemeral). общий тир-лист обновится после **отправить**.")
+    .setDescription("кнопка **начать оценку** откроет полный опрос. **оценить новых** позволит дооценить только что добавленных персонажей без сброса твоего тир-листа.")
     .setImage("attachment://tierlist.png");
 
   await msg.edit({ embeds: [embed], files: [attachment], components: dashboardComponents(), attachments: [] });
@@ -1379,6 +1624,81 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(ok ? "Картинка обновлена." : "Не нашёл dashboard. Сначала /setup.");
       }
 
+      if (interaction.commandName === "character") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
+        const sub = interaction.options.getSubcommand();
+
+        if (sub === "add") {
+          const name = (interaction.options.getString("name", true) || "").trim().slice(0, 100);
+          const image = interaction.options.getAttachment("image", true);
+          const requestedId = interaction.options.getString("id");
+          const characterId = normalizeCharacterId(requestedId || name);
+
+          if (!name) {
+            return interaction.reply({ content: "Имя персонажа пустое.", ephemeral: true });
+          }
+          if (!characterId) {
+            return interaction.reply({ content: "Не удалось получить id. Укажи `id` латиницей или дай имя попроще.", ephemeral: true });
+          }
+          if (charById.has(characterId)) {
+            return interaction.reply({ content: `Персонаж с id \`${characterId}\` уже существует.`, ephemeral: true });
+          }
+
+          const imageType = detectAttachmentImageType(image);
+          if (!imageType) {
+            return interaction.reply({ content: "Поддерживаются только PNG и JPG/JPEG.", ephemeral: true });
+          }
+
+          await interaction.deferReply({ ephemeral: true });
+
+          const imageBuffer = await downloadBuffer(image.url);
+          const normalizedPng = await normalizeCharacterImageBuffer(imageBuffer, imageType, 512);
+          const customCharacters = readCustomCharacters();
+
+          if (customCharacters.some(c => c?.id === characterId) || charById.has(characterId)) {
+            return interaction.editReply(`Персонаж с id \`${characterId}\` уже существует.`);
+          }
+
+          const entry = { id: characterId, name, enabled: true };
+          const nextCustomCharacters = [...customCharacters, entry];
+          const imagePath = getCustomCharacterImagePath(characterId);
+          let imageWritten = false;
+
+          try {
+            writeBufferAtomic(imagePath, normalizedPng);
+            imageWritten = true;
+            saveJsonAtomic(CUSTOM_CHARACTERS_PATH, nextCustomCharacters);
+          } catch (e) {
+            if (imageWritten) {
+              try { fs.unlinkSync(imagePath); } catch {}
+            }
+            throw e;
+          }
+
+          reloadCharacterCatalog();
+          iconCache.delete(characterId);
+          appendCharacterToActiveWizards(characterId);
+          saveState(state);
+
+          let dashboardMessage = "Dashboard обновлён.";
+          try {
+            const dashboardUpdated = await refreshDashboard(client);
+            if (!dashboardUpdated) {
+              dashboardMessage = "Персонаж сохранён, но dashboard пока не найден. Сначала /setup.";
+            }
+          } catch (e) {
+            dashboardMessage = `Персонаж сохранён, но dashboard не обновился: ${e?.message || "unknown"}`;
+          }
+
+          const replyLines = [
+            `Персонаж **${name}** добавлен.`,
+            `id: \`${characterId}\``,
+            dashboardMessage
+          ];
+          return interaction.editReply(replyLines.join("\n"));
+        }
+      }
+
       if (interaction.commandName === "stats") {
         if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав.", ephemeral: true });
         const { votersCount } = computeGlobalBuckets();
@@ -1721,15 +2041,61 @@ if (interaction.customId === "refresh_tierlist") {
         }
 
         const embed = buildStartEmbed(userId);
-        const rows = [buildMainSelect(userId), buildStartButtons(userId)];
+        const rows = [...buildMainSelectRows(userId), buildStartButtons(userId)];
         return interaction.reply({ embeds: [embed], components: rows, ephemeral: true });
+      }
+
+      if (interaction.customId === "rate_new_characters") {
+        if (!hasSubmittedTierlist(userId)) {
+          return interaction.reply({
+            content: "Сначала отправь обычный тир-лист через кнопку **Начать оценку**.",
+            ephemeral: true
+          });
+        }
+
+        if (u.wizMode === "new" && u.mainId && u.wizQueue && !wizardDone(userId)) {
+          const payload = await buildWizardPayload(userId);
+          return interaction.reply({ ...payload, ephemeral: true });
+        }
+
+        if (u.wizMode === "full" && u.mainId && u.wizQueue && !wizardDone(userId)) {
+          return interaction.reply({
+            content: "У тебя уже идёт обычная оценка. Сначала закончи её или закрой текущее окно.",
+            ephemeral: true
+          });
+        }
+
+        const pendingIds = getPendingNewCharacterIds(userId);
+        if (pendingIds.length === 0) {
+          return interaction.reply({
+            content: "Новых персонажей для дооценки пока нет.",
+            ephemeral: true
+          });
+        }
+
+        startWizard(userId, "new");
+        saveState(state);
+
+        const payload = await buildWizardPayload(userId);
+        return interaction.reply({ ...payload, ephemeral: true });
+      }
+
+      if (interaction.customId === "main_page_prev" || interaction.customId === "main_page_next") {
+        if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
+
+        u.mainSelectPage = clampMainSelectPage((u.mainSelectPage || 0) + (interaction.customId === "main_page_next" ? 1 : -1));
+        saveState(state);
+
+        const embed = buildStartEmbed(userId);
+        const rows = [...buildMainSelectRows(userId), buildStartButtons(userId)];
+        return interaction.update({ embeds: [embed], components: rows });
       }
 
       if (interaction.customId === "wiz_use_current_main") {
         if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
         if (!u.mainId) return interaction.reply({ content: "Сначала выбери main.", ephemeral: true });
 
-        startWizard(userId);
+        startWizard(userId, "full");
         saveState(state);
 
         await interaction.deferUpdate();
@@ -1742,7 +2108,7 @@ if (interaction.customId === "refresh_tierlist") {
       }
 
       if (interaction.customId === "wiz_back") {
-        if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
+        if (!canUseCurrentWizard(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
         if (!u.wizQueue) return interaction.reply({ content: "Сначала нажми начать оценку.", ephemeral: true });
 
         wizardBack(userId);
@@ -1754,7 +2120,7 @@ if (interaction.customId === "refresh_tierlist") {
       }
 
       if (interaction.customId.startsWith("wiz_rate_")) {
-        if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
+        if (!canUseCurrentWizard(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
         if (!u.mainId || !u.wizQueue) return interaction.reply({ content: "Сначала выбери main.", ephemeral: true });
         if (wizardDone(userId)) return interaction.reply({ content: "Уже всё оценено. Нажми Отправить.", ephemeral: true });
 
@@ -1772,7 +2138,7 @@ if (interaction.customId === "refresh_tierlist") {
       }
 
       if (interaction.customId === "wiz_submit") {
-        if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
+        if (!canUseCurrentWizard(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
         if (!u.mainId || !u.wizQueue) return interaction.reply({ content: "Сначала выбери main.", ephemeral: true });
         if (!wizardDone(userId)) return interaction.reply({ content: "Сначала оцени всех персонажей.", ephemeral: true });
 
@@ -1786,17 +2152,26 @@ if (interaction.customId === "refresh_tierlist") {
         u.influenceRoleId = inf.roleId;
         u.influenceUpdatedAt = Date.now();
 
+        const submittedMode = u.wizMode;
         u.lastSubmitAt = Date.now();
-        lockUser(userId);
+        if (submittedMode !== "new") {
+          lockUser(userId);
+        }
+        const nextAllowedAt = getUser(userId).lockUntil;
         u.wizQueue = null;
         u.wizIndex = 0;
+        u.wizMode = null;
         saveState(state);
 
         await refreshDashboard(client);
 
         const doneMsg = new EmbedBuilder()
           .setTitle("Готово")
-          .setDescription(`Оценки сохранены. Следующая попытка после **${formatTime(getUser(userId).lockUntil)}**.`);
+          .setDescription(
+            submittedMode === "new"
+              ? "Новые персонажи дооценены. Твой прошлый тир-лист сохранён и обновлён."
+              : `Оценки сохранены. Следующая попытка после **${formatTime(nextAllowedAt)}**.`
+          );
 
         return interaction.editReply({ embeds: [doneMsg], components: [], files: [], attachments: [] });
       }
@@ -1831,7 +2206,7 @@ if (interaction.customId === "panel_select_tier") {
 
         const mainId = interaction.values[0];
         setMain(userId, mainId);
-        startWizard(userId);
+        startWizard(userId, "full");
         saveState(state);
 
         await interaction.deferUpdate();

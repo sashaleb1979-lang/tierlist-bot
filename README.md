@@ -50,13 +50,22 @@ In Discord run:
 Bot will post and pin the dashboard.
 
 ## 3) Add character icons (to look like a real tierlist)
-Put 16 PNG files into:
+Put base PNG files into:
 - `assets/characters/`
 
 Filenames must match ids from `config/characters.json`, e.g. `honored_one.png`.
 
 Then run in Discord:
 - `/rebuild` (or just Submit once; image updates on Submit)
+
+To add new characters without touching files manually, use:
+- `/character add name:Ryu image:<upload>`
+
+The bot will:
+- normalize the uploaded image into a `512x512` PNG
+- save it into `data/characters/<id>.png`
+- save metadata into `data/characters.custom.json`
+- rebuild the dashboard immediately
 
 ## 4) Rename tier labels (mods)
 - `/tiers set tier:S name:Имба`
@@ -71,7 +80,7 @@ Then run in Discord:
    - GUILD_ID
    - COOLDOWN_HOURS=24
    - DATA_DIR=./data
-4) Add a **Volume** and mount it to `/app/data` so `data/state.json` survives redeploys.
+4) Add a **Volume** and mount it to `/app/data` so `data/state.json`, `data/characters.custom.json`, and `data/characters/` survive redeploys.
 5) Deploy. Check logs: "Logged in as ..."
 
 ## Notes

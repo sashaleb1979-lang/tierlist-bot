@@ -16,5 +16,6 @@
   { "id": "aspiring_mangaka", "name": "Aspiring Mangaka", "enabled": true },
   { "id": "lucky_coward", "name": "Lucky Coward", "enabled": true },
   { "id": "disaster_plants", "name": "Disaster Plants", "enabled": true },
-  { "id": "crow_charmer", "name": "Crow Charmer", "enabled": true }
+  { "id": "crow_charmer", "name": "Crow Charmer", "enabled": true },
+  { "id": "ryu", "name": "Ryu", "enabled": true }
 ]

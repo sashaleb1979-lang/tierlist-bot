@@ -50,6 +50,31 @@ const commands = [
     .setDescription("Пересобрать картинку тир-листа (mods)"),
 
   new SlashCommandBuilder()
+    .setName("character")
+    .setDescription("Управление персонажами (mods)")
+    .addSubcommand(sc =>
+      sc.setName("add")
+        .setDescription("Добавить нового персонажа по загруженной картинке")
+        .addStringOption(opt =>
+          opt.setName("name")
+            .setDescription("Отображаемое имя персонажа")
+            .setRequired(true)
+            .setMaxLength(100)
+        )
+        .addAttachmentOption(opt =>
+          opt.setName("image")
+            .setDescription("Полная картинка персонажа (PNG/JPG)")
+            .setRequired(true)
+        )
+        .addStringOption(opt =>
+          opt.setName("id")
+            .setDescription("Необязательный id латиницей, например ryu")
+            .setRequired(false)
+            .setMaxLength(64)
+        )
+    ),
+
+  new SlashCommandBuilder()
     .setName("stats")
     .setDescription("Статус бота/дашборда (mods)"),
 
