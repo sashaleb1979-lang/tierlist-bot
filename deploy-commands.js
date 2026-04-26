@@ -21,6 +21,15 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName("summary")
+    .setDescription("Создать/обновить summary-сообщение с персонажами по тирам")
+    .addChannelOption(opt =>
+      opt.setName("channel")
+        .setDescription("Канал, где будет summary-сообщение")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
     .setName("tiers")
     .setDescription("Управление названиями тиров (для картинки)")
     .addSubcommand(sc =>

@@ -51,6 +51,7 @@ if (!DISCORD_TOKEN || !GUILD_ID) {
 }
 
 const COOLDOWN_MS = Number(COOLDOWN_HOURS) * 60 * 60 * 1000;
+const SUMMARY_REFRESH_MS = 20 * 60 * 1000;
 const ADMIN_ROLE_SET = new Set(
   (ADMIN_ROLE_IDS || "")
     .split(",")
@@ -124,9 +125,8 @@ async function backfillInfluenceForExistingVoters(client, { refresh = true } = {
 
   if (changed > 0) saveState(state);
 
-  const hasDashboard = Boolean(state.settings?.channelId && state.settings?.dashboardMessageId);
-  if (refresh && changed > 0 && hasDashboard) {
-    await refreshDashboard(client).catch(() => {});
+  if (refresh && changed > 0) {
+    await refreshPublicViews(client).catch(() => {});
   }
 
   return { total: voterIds.length, changed };
@@ -215,6 +215,9 @@ function defaultState() {
       channelId: DEFAULT_CHANNEL_ID || null,
       dashboardMessageId: null,
       lastUpdated: 0,
+      summaryChannelId: null,
+      summaryMessageId: null,
+      summaryLastUpdated: 0,
       image: {
         width: null,
         height: null,
@@ -246,6 +249,9 @@ function loadState() {
     const def = defaultState();
     st.settings ||= def.settings;
     st.settings.image ||= def.settings.image;
+    if (!Object.prototype.hasOwnProperty.call(st.settings, "summaryChannelId")) st.settings.summaryChannelId = def.settings.summaryChannelId;
+    if (!Object.prototype.hasOwnProperty.call(st.settings, "summaryMessageId")) st.settings.summaryMessageId = def.settings.summaryMessageId;
+    if (!Object.prototype.hasOwnProperty.call(st.settings, "summaryLastUpdated")) st.settings.summaryLastUpdated = def.settings.summaryLastUpdated;
     st.tiers ||= tierDefaults;
     st.users ||= {};
     st.draftVotes ||= {};
@@ -513,6 +519,55 @@ async function renderUserFinalTierlistPng(targetUserId, titleSuffix) {
     buckets,
     lockedId: mainId
   });
+}
+
+function buildSummaryEmbed() {
+  const { buckets, votersCount } = computeGlobalBuckets();
+  const updatedAt = Date.now();
+  const embed = new EmbedBuilder()
+    .setTitle(`${DASHBOARD_TITLE} Summary`)
+    .setDescription(
+      [
+        "Персонажи распределены по актуальным глобальным тирам.",
+        `Учтено голосов: **${votersCount}**.`,
+        `Обновлено: ${formatTime(updatedAt)}`
+      ].join("\n")
+    )
+    .setTimestamp(updatedAt);
+
+  for (const tierKey of ["S", "A", "B", "C", "D"]) {
+    const tierName = state.tiers?.[tierKey]?.name || tierDefaults?.[tierKey]?.name || tierKey;
+    const ids = buckets[tierKey] || [];
+    if (ids.length === 0) continue;
+
+    const chunks = [];
+    let currentChunk = "";
+    for (const characterId of ids) {
+      const line = `• ${charById.get(characterId)?.name || characterId}`;
+      const nextChunk = currentChunk ? `${currentChunk}\n${line}` : line;
+      if (nextChunk.length > 1024) {
+        if (currentChunk) chunks.push(currentChunk);
+        currentChunk = line;
+      } else {
+        currentChunk = nextChunk;
+      }
+    }
+    if (currentChunk) chunks.push(currentChunk);
+
+    for (let index = 0; index < chunks.length; index++) {
+      embed.addFields({
+        name: index === 0 ? tierName : `${tierName} (продолжение ${index + 1})`,
+        value: chunks[index],
+        inline: false
+      });
+    }
+  }
+
+  if (!embed.data.fields?.length) {
+    embed.addFields({ name: "Персонажи", value: "Пока нечего показывать.", inline: false });
+  }
+
+  return embed;
 }
 
 // -------------------- IMAGE CONFIG --------------------
@@ -1165,6 +1220,66 @@ async function refreshDashboard(client) {
   return true;
 }
 
+async function ensureSummaryMessage(client, channelId) {
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const channel = await guild.channels.fetch(channelId);
+  if (!channel || !channel.isTextBased()) throw new Error("Channel is not text based");
+
+  let msg = null;
+  if (state.settings.summaryMessageId && state.settings.summaryChannelId === channelId) {
+    try { msg = await channel.messages.fetch(state.settings.summaryMessageId); } catch { msg = null; }
+  }
+
+  const embed = buildSummaryEmbed();
+
+  if (!msg) {
+    msg = await channel.send({ embeds: [embed] });
+  } else {
+    await msg.edit({ embeds: [embed] });
+  }
+
+  state.settings.summaryChannelId = channelId;
+  state.settings.summaryMessageId = msg.id;
+  state.settings.summaryLastUpdated = Date.now();
+  saveState(state);
+  return msg;
+}
+
+async function refreshSummaryMessage(client) {
+  const channelId = state.settings.summaryChannelId;
+  const msgId = state.settings.summaryMessageId;
+  if (!channelId || !msgId) return false;
+
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const channel = await guild.channels.fetch(channelId);
+  if (!channel || !channel.isTextBased()) return false;
+
+  let msg;
+  try {
+    msg = await channel.messages.fetch(msgId);
+  } catch {
+    await ensureSummaryMessage(client, channelId);
+    return true;
+  }
+
+  await msg.edit({ embeds: [buildSummaryEmbed()] });
+  state.settings.summaryLastUpdated = Date.now();
+  saveState(state);
+  return true;
+}
+
+async function refreshPublicViews(client) {
+  const [dashboard, summary] = await Promise.allSettled([
+    refreshDashboard(client),
+    refreshSummaryMessage(client)
+  ]);
+
+  return {
+    dashboard: dashboard.status === "fulfilled" ? dashboard.value : false,
+    summary: summary.status === "fulfilled" ? summary.value : false
+  };
+}
+
 
 // -------------------- MOD PANEL (ephemeral control window) --------------------
 function buildPanelTierSelect(userId) {
@@ -1524,6 +1639,12 @@ client.once("ready", async () => {
     console.error("[influence] startup backfill failed:", e?.message || e);
   }
 
+  setInterval(() => {
+    refreshSummaryMessage(client).catch((e) => {
+      console.error("[summary] scheduled refresh failed:", e?.message || e);
+    });
+  }, SUMMARY_REFRESH_MS);
+
 });
 
 
@@ -1553,7 +1674,7 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
 
     if (hasVote) {
       // their weight affects global tierlist -> refresh image
-      await refreshDashboard(client).catch(() => {});
+      await refreshPublicViews(client).catch(() => {});
     }
   } catch {
     // ignore
@@ -1579,7 +1700,7 @@ client.on("interactionCreate", async (interaction) => {
         saveState(state);
 
         await interaction.deferReply({ ephemeral: true });
-        await refreshDashboard(client);
+        await refreshPublicViews(client);
         return interaction.editReply(`Ок. Теперь **${tierKey}** называется: **${name}**.`);
       }
 
@@ -1601,6 +1722,19 @@ client.on("interactionCreate", async (interaction) => {
   }
 }
 
+      if (interaction.commandName === "summary") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
+        const ch = interaction.options.getChannel("channel", true);
+        await interaction.deferReply({ ephemeral: true });
+        try {
+          await ensureSummaryMessage(client, ch.id);
+          return interaction.editReply("Готово. Summary-сообщение создано или обновлено.");
+        } catch (e) {
+          console.error("summary failed:", e);
+          return interaction.editReply(`Summary failed: ${e?.message || "unknown"}`);
+        }
+      }
+
       if (interaction.commandName === "tiers") {
         if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
         const sub = interaction.options.getSubcommand();
@@ -1612,7 +1746,7 @@ client.on("interactionCreate", async (interaction) => {
           saveState(state);
 
           await interaction.deferReply({ ephemeral: true });
-          await refreshDashboard(client);
+          await refreshPublicViews(client);
           return interaction.editReply(`Ок. Теперь **${tier}** называется: **${name}** (картинка обновлена).`);
         }
       }
@@ -1620,8 +1754,11 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.commandName === "rebuild") {
         if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
         await interaction.deferReply({ ephemeral: true });
-        const ok = await refreshDashboard(client);
-        return interaction.editReply(ok ? "Картинка обновлена." : "Не нашёл dashboard. Сначала /setup.");
+        const { dashboard, summary } = await refreshPublicViews(client);
+        if (!dashboard && !summary) {
+          return interaction.editReply("Не нашёл ни dashboard, ни summary. Сначала /setup и /summary.");
+        }
+        return interaction.editReply(`Обновление выполнено. Dashboard: ${dashboard ? "ok" : "—"}, summary: ${summary ? "ok" : "—"}.`);
       }
 
       if (interaction.commandName === "character") {
@@ -1680,14 +1817,19 @@ client.on("interactionCreate", async (interaction) => {
           appendCharacterToActiveWizards(characterId);
           saveState(state);
 
-          let dashboardMessage = "Dashboard обновлён.";
+          let dashboardMessage = "Публичные сообщения обновлены.";
           try {
-            const dashboardUpdated = await refreshDashboard(client);
-            if (!dashboardUpdated) {
-              dashboardMessage = "Персонаж сохранён, но dashboard пока не найден. Сначала /setup.";
+            const { dashboard, summary } = await refreshPublicViews(client);
+            if (!dashboard && !summary) {
+              dashboardMessage = "Персонаж сохранён, но dashboard и summary пока не настроены. Сначала /setup и /summary.";
+            } else {
+              const updatedTargets = [];
+              if (dashboard) updatedTargets.push("dashboard");
+              if (summary) updatedTargets.push("summary");
+              dashboardMessage = `Обновлено: ${updatedTargets.join(", ")}.`;
             }
           } catch (e) {
-            dashboardMessage = `Персонаж сохранён, но dashboard не обновился: ${e?.message || "unknown"}`;
+            dashboardMessage = `Персонаж сохранён, но публичные сообщения не обновились: ${e?.message || "unknown"}`;
           }
 
           const replyLines = [
@@ -1706,8 +1848,11 @@ client.on("interactionCreate", async (interaction) => {
         const lines = [
           `channelId: ${state.settings.channelId || "—"}`,
           `dashboardMessageId: ${state.settings.dashboardMessageId || "—"}`,
+          `summaryChannelId: ${state.settings.summaryChannelId || "—"}`,
+          `summaryMessageId: ${state.settings.summaryMessageId || "—"}`,
           `voters: ${votersCount}`,
           `lastUpdated: ${state.settings.lastUpdated ? formatTime(state.settings.lastUpdated) : "—"}`,
+          `summaryLastUpdated: ${state.settings.summaryLastUpdated ? formatTime(state.settings.summaryLastUpdated) : "—"}`,
           `img: ${cfg.W}x${cfg.H}, icon=${cfg.ICON}`
         ];
         return interaction.reply({ content: lines.join("\n"), ephemeral: true });
@@ -1751,7 +1896,7 @@ client.on("interactionCreate", async (interaction) => {
           saveState(state);
 
           await interaction.deferReply({ ephemeral: true });
-          await refreshDashboard(client);
+          await refreshPublicViews(client);
           const cfg = getImageConfig();
           return interaction.editReply(`Ок. Теперь img: ${cfg.W}x${cfg.H}, icon=${cfg.ICON} (картинка обновлена).`);
         }
@@ -1774,8 +1919,11 @@ if (interaction.customId === "refresh_tierlist") {
     return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
   }
   await interaction.deferReply({ ephemeral: true });
-  const ok = await refreshDashboard(client);
-  return interaction.editReply(ok ? "Ок. Тир-лист обновлён." : "Не нашёл dashboard. Сначала /setup.");
+  const { dashboard, summary } = await refreshPublicViews(client);
+  if (!dashboard && !summary) {
+    return interaction.editReply("Не нашёл ни dashboard, ни summary. Сначала /setup и /summary.");
+  }
+  return interaction.editReply(`Ок. Обновлено: dashboard ${dashboard ? "ok" : "—"}, summary ${summary ? "ok" : "—"}.`);
 }
 
       if (interaction.customId === "my_status") {
@@ -1940,7 +2088,7 @@ if (interaction.customId === "refresh_tierlist") {
           saveState(state);
 
           await interaction.deferUpdate();
-          await refreshDashboard(client);
+          await refreshPublicViews(client);
           return interaction.editReply(buildPanelPayload(userId));
         }
 
@@ -1951,7 +2099,7 @@ if (interaction.customId === "refresh_tierlist") {
 
         if (interaction.customId === "panel_refresh") {
           await interaction.deferUpdate();
-          await refreshDashboard(client);
+          await refreshPublicViews(client);
           return interaction.editReply(buildPanelPayload(userId));
         }
 
@@ -1960,7 +2108,7 @@ if (interaction.customId === "refresh_tierlist") {
           applyImageDelta("icon", interaction.customId === "panel_icon_plus" ? step : -step);
           saveState(state);
           await interaction.deferUpdate();
-          await refreshDashboard(client);
+          await refreshPublicViews(client);
           return interaction.editReply(buildPanelPayload(userId));
         }
 
@@ -1969,7 +2117,7 @@ if (interaction.customId === "refresh_tierlist") {
           applyImageDelta("width", interaction.customId === "panel_w_plus" ? step : -step);
           saveState(state);
           await interaction.deferUpdate();
-          await refreshDashboard(client);
+          await refreshPublicViews(client);
           return interaction.editReply(buildPanelPayload(userId));
         }
 
@@ -1978,7 +2126,7 @@ if (interaction.customId === "refresh_tierlist") {
           applyImageDelta("height", interaction.customId === "panel_h_plus" ? step : -step);
           saveState(state);
           await interaction.deferUpdate();
-          await refreshDashboard(client);
+          await refreshPublicViews(client);
           return interaction.editReply(buildPanelPayload(userId));
         }
 
@@ -1986,7 +2134,7 @@ if (interaction.customId === "refresh_tierlist") {
           resetImageOverrides();
           saveState(state);
           await interaction.deferUpdate();
-          await refreshDashboard(client);
+          await refreshPublicViews(client);
           return interaction.editReply(buildPanelPayload(userId));
         }
 
@@ -2163,7 +2311,7 @@ if (interaction.customId === "refresh_tierlist") {
         u.wizMode = null;
         saveState(state);
 
-        await refreshDashboard(client);
+        await refreshPublicViews(client);
 
         const doneMsg = new EmbedBuilder()
           .setTitle("Готово")

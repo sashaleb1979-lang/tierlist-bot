@@ -1,9 +1,11 @@
-# Tierlist Bot (1 channel + pinned dashboard + image tierlist)
+# Tierlist Bot (pinned dashboard + image tierlist + optional summary channel)
 
 ## What it does
 - One channel (recommended: `#tierlist`).
 - Bot posts **one** dashboard message and pins it.
 - Dashboard shows a **generated PNG tierlist** (S/A/B/C/D) with character icons.
+- Bot can also post a separate **summary embed** in another channel via `/summary`.
+- Summary uses the latest tier names from bot settings/panel and refreshes automatically every 20 minutes.
 - Button **Start rating** opens an **ephemeral wizard** (no channel spam):
   - choose main (required)
   - rate all other 15 characters
@@ -49,6 +51,11 @@ In Discord run:
 
 Bot will post and pin the dashboard.
 
+To create the separate summary message in another text channel run:
+- `/summary channel:#mains`
+
+Bot will post one embed message there and keep editing the same message on updates.
+
 ## 3) Add character icons (to look like a real tierlist)
 Put base PNG files into:
 - `assets/characters/`
@@ -57,6 +64,8 @@ Filenames must match ids from `config/characters.json`, e.g. `honored_one.png`.
 
 Then run in Discord:
 - `/rebuild` (or just Submit once; image updates on Submit)
+
+`/rebuild` also refreshes the summary embed if it is configured.
 
 To add new characters without touching files manually, use:
 - `/character add name:Ryu image:<upload>`
